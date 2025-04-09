@@ -24,6 +24,8 @@ dependencies:
   - pydantic =2
   - click
   - scipy
+  - bokeh
+  - panel
 
   - qcportal ~=0.55
 

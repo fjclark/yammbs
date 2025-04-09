@@ -2,6 +2,7 @@ import logging
 import pathlib
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
+from typing import ForwardRef
 
 import numpy
 from numpy.typing import NDArray
@@ -607,3 +608,201 @@ class TorsionStore:
             }
 
         return metrics
+
+    def get_torsion_image(self, molecule_id: int) -> str:
+        """
+        Get an image of the molecule with the dihedral highlighted.
+        """
+        from openff.toolkit import Molecule
+        from rdkit.Chem import AllChem
+        from rdkit.Chem.Draw import rdMolDraw2D
+
+        smiles = self.get_smiles_by_molecule_id(molecule_id)
+        dihedral_indices = self.get_dihedral_indices_by_molecule_id(molecule_id)
+
+        # Use the mapped SMILES to get the molecule
+        mol = Molecule.from_mapped_smiles(smiles, allow_undefined_stereo=True)
+        if mol is None:
+            raise ValueError(f"Could not convert SMILES to molecule: {smiles}")
+
+        rdmol = mol.to_rdkit()
+
+        # Draw in 2D - compute 2D coordinates
+        AllChem.Compute2DCoords(rdmol)
+        # Highlight the dihedral
+        atom_indices = [dihedral_indices[0], dihedral_indices[1], dihedral_indices[2], dihedral_indices[3]]
+        bond_indices = [
+            rdmol.GetBondBetweenAtoms(atom_indices[0], atom_indices[1]).GetIdx(),
+            rdmol.GetBondBetweenAtoms(atom_indices[1], atom_indices[2]).GetIdx(),
+            rdmol.GetBondBetweenAtoms(atom_indices[2], atom_indices[3]).GetIdx(),
+        ]
+
+        # Create an SVG drawer
+        drawer = rdMolDraw2D.MolDraw2DSVG(200, 200)  # Set the size of the image (width x height)
+        drawer.SetFontSize(0.8)  # Optional: Adjust font size for better readability
+
+        # Prepare the molecule for drawing
+        rdMolDraw2D.PrepareAndDrawMolecule(
+            drawer,
+            rdmol,
+            highlightAtoms=atom_indices,
+            highlightBonds=bond_indices,
+        )
+
+        # Finish the drawing and get the SVG text
+        drawer.FinishDrawing()
+        svg = drawer.GetDrawingText()
+
+        # If `html` is True, return the SVG as an embeddable HTML image tag
+        import base64
+
+        svg_base64 = base64.b64encode(svg.encode()).decode()
+        img_tag = f'<img src="data:image/svg+xml;base64,{svg_base64}" alt="Molecule Image" />'
+        return img_tag
+
+    def get_scan_image(
+        self,
+        molecule_id: int,
+        force_fields: list[str] | None = None,
+    ) -> str:
+        import numpy as np
+        from matplotlib import pyplot as plt
+
+        # Create plot
+        fig, torsion_axis = plt.subplots(figsize=(3.6, 1.9), dpi=300)
+
+        # Get the energies
+        _qm = self.get_qm_energies_by_molecule_id(molecule_id)
+        _qm = dict(sorted(_qm.items()))
+        qm_minimum_index = min(_qm, key=_qm.get)
+
+        # Make a new dict to avoid in-place modification while iterating
+        qm = {key: _qm[key] - _qm[qm_minimum_index] for key in _qm}
+
+        # Assume a default grid spacing of 15 degrees (BespokeFit default)
+        angles = np.arange(-165, 195, 15)
+        assert len(angles) == len(qm), "QM data and angles should match in length"
+
+        torsion_axis.plot(
+            qm.keys(),
+            qm.values(),
+            "k.-",
+            label="QM",
+        )
+
+        for force_field in force_fields:
+            mm = dict(sorted(self.get_mm_energies_by_molecule_id(molecule_id, force_field=force_field).items()))
+            if len(mm) == 0:
+                continue
+
+            torsion_axis.plot(
+                angles,
+                [val - mm[qm_minimum_index] for val in mm.values()],
+                "o--",
+                label=force_field,
+            )
+
+            torsion_axis.legend(loc=0, bbox_to_anchor=(1.05, 1))
+
+        # Label the axes
+        torsion_axis.set_ylabel(r"Energy / kcal mol$^{-1}$")
+        torsion_axis.set_xlabel("Torsion angle / degrees")
+
+        # Convert the plot to SVG
+        import base64
+        from io import BytesIO
+
+        buf = BytesIO()
+        plt.savefig(buf, format="svg", bbox_inches="tight")
+        buf.seek(0)
+        svg_data = buf.getvalue()
+        buf.close()
+
+        # Close the figure
+        plt.close(fig)
+
+        # Encode the SVG data to base64
+        svg_base64 = base64.b64encode(svg_data).decode()
+        img_tag = f'<img src="data:image/svg+xml;base64,{svg_base64}" alt="Scan Image" />'
+        return img_tag
+
+    def get_summary_df(
+        self,
+        force_fields: list[str],
+    ) -> ForwardRef("pd.Dataframe"):
+        """Get a summary dataframe of the metrics for a given force field."""
+        import pandas as pd
+        from tqdm import tqdm
+
+        rows = []
+        metrics = self.get_metrics().metrics
+        metrics_to_plot = {
+            "RMSD / A": lambda x: x.rmsd,
+            "RMSE / kcal mol-1": lambda x: x.rmse,
+            "Mean Error / kcal mol-1": lambda x: x.mean_error,
+            "JS Divergence": lambda x: x.js_divergence[0],
+        }
+
+        for mol_id in tqdm(self.get_molecule_ids()):
+            row = {}
+            row["ID"] = mol_id
+            row["Torsion Image"] = self.get_torsion_image(mol_id)
+            row["Scan Image"] = self.get_scan_image(mol_id, force_fields=force_fields)
+
+            for metric, metric_func in metrics_to_plot.items():
+                for force_field in force_fields:
+                    row[f"{metric}\n{force_field}"] = metric_func(metrics[force_field][mol_id])
+
+                rows.append(row)
+
+        return pd.DataFrame(rows)
+
+    def get_summary(
+        self,
+        file_name: str,
+        force_fields: list[str] | None = None,
+    ) -> None:
+        """
+        Create a html summary of the metrics for a given force field.
+        """
+        import bokeh
+        import panel
+
+        force_fields = force_fields if force_fields else self.get_force_fields()
+
+        df = self.get_summary_df(force_fields)
+
+        number_format = bokeh.models.widgets.tables.NumberFormatter(format="0.0000")
+
+        formatters = {col: "html" if "Image" in col else number_format for col in df.columns}
+
+        frozen_colums = ["ID", "Torsion Image", "Scan Image"]
+
+        tabulator = panel.widgets.Tabulator(
+            df,
+            show_index=False,
+            selectable=False,
+            disabled=True,
+            formatters=formatters,
+            configuration={"rowHeight": 200},
+            sizing_mode="stretch_width",
+            frozen_columns=frozen_colums,
+            page_size=4,
+            pagination="local",
+        )
+
+        # unstyled_cols = ["ID", "Torsion Image", "Scan Image"]
+
+        # for col in df.columns:
+        #     if col in unstyled_cols:
+        #         continue
+        #     col_min = df[col].min()
+        #     col_max = df[col].max()
+        #     tabulator.style.background_gradient(cmap="RdYlGn_r", subset=[col], low=col_min, high=col_max, axis=0)
+
+        layout = panel.Column(
+            None,
+            tabulator,
+        )
+
+        layout.save(file_name, title="MetricsSummary", embed=True)

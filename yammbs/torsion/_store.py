@@ -11,6 +11,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from typing_extensions import Self
 
+from yammbs._minimize import _shorthand_to_full_force_field_name
 from yammbs._molecule import _smiles_to_inchi_key
 from yammbs._types import Pathlike
 from yammbs.analysis import get_rmsd
@@ -609,6 +610,37 @@ class TorsionStore:
 
         return metrics
 
+    def get_proper_torsion_by_molecule_id(
+        self,
+        molecule_id: int,
+        force_field_name: str,
+    ) -> list["openff.toolkit.typing.engines.smirnoff.parameters.ProperTorsionHandler.ProperTorsionType"]:  # noqa: F821
+        from openff.toolkit import ForceField, Molecule
+
+        if not force_field_name.endswith(".offxml"):
+            force_field_name = _shorthand_to_full_force_field_name(
+                force_field_name,
+                make_unconstrained=True,
+            )
+
+        # Get the central two atoms for the dihedral being scanned
+        central_dihedral_indices = self.get_dihedral_indices_by_molecule_id(molecule_id)[1:3]
+        ff = ForceField(force_field_name)
+        mol = Molecule.from_mapped_smiles(
+            self.get_smiles_by_molecule_id(molecule_id),
+            allow_undefined_stereo=True,
+        )
+        proper_torsions = ff.label_molecules(mol.to_topology())[0]["ProperTorsions"]
+
+        # Get all dihedrals which match the central two atoms
+        matched_dihedrals = []
+        for indices, dihedral in proper_torsions.items():
+            # Also check that reverse order matches
+            if indices[1:3] == central_dihedral_indices or indices[1:3] == central_dihedral_indices[::-1]:
+                matched_dihedrals.append(dihedral)
+
+        return matched_dihedrals
+
     def get_torsion_image(self, molecule_id: int) -> str:
         """
         Get an image of the molecule with the dihedral highlighted.
@@ -729,8 +761,24 @@ class TorsionStore:
     def get_summary_df(
         self,
         force_fields: list[str],
+        show_parameters: bool = False,
     ) -> ForwardRef("pd.Dataframe"):
-        """Get a summary dataframe of the metrics for a given force field."""
+        """
+        Get a summary dataframe of the metrics for a given force field.
+
+        Parameters
+        ----------
+        force_fields : list[str]
+            The force fields to include in the summary dataframe.
+
+        show_parameters : bool
+            Whether to include the dihedral parameters in the summary dataframe.
+
+        Returns
+        -------
+        pd.DataFrame
+            A dataframe containing the summary of the metrics for the given force fields.
+        """
         import pandas as pd
         from tqdm import tqdm
 
@@ -753,7 +801,17 @@ class TorsionStore:
                 for force_field in force_fields:
                     row[f"{metric}\n{force_field}"] = metric_func(metrics[force_field][mol_id])
 
-                rows.append(row)
+            # Also add the dihedral type for each force field, if requested
+            if show_parameters:
+                for force_field in force_fields:
+                    proper_torsions = self.get_proper_torsion_by_molecule_id(
+                        molecule_id=mol_id,
+                        force_field_name=force_field,
+                    )
+                    row[f"Proper Torsion SMIRKS\n{force_field}"] = "\n".join(t.smirks for t in proper_torsions)
+                    row[f"Proper Torsion\n{force_field}"] = "\n".join(str(t) for t in proper_torsions)
+
+            rows.append(row)
 
         return pd.DataFrame(rows)
 
@@ -761,6 +819,7 @@ class TorsionStore:
         self,
         file_name: str,
         force_fields: list[str] | None = None,
+        show_parameters: bool = False,
     ) -> None:
         """
         Create a html summary of the metrics for a given force field.
@@ -770,11 +829,19 @@ class TorsionStore:
 
         force_fields = force_fields if force_fields else self.get_force_fields()
 
-        df = self.get_summary_df(force_fields)
+        df = self.get_summary_df(force_fields, show_parameters=show_parameters)
 
         number_format = bokeh.models.widgets.tables.NumberFormatter(format="0.0000")
+        string_format = {"type": "textarea", "whiteSpace": "pre-wrap"}
 
-        formatters = {col: "html" if "Image" in col else number_format for col in df.columns}
+        formatters = {}
+        for col in df.columns:
+            if "Image" in col:
+                formatters[col] = "html"
+            elif "Proper Torsion" in col:
+                formatters[col] = string_format
+            else:
+                formatters[col] = number_format
 
         frozen_colums = ["ID", "Torsion Image", "Scan Image"]
 

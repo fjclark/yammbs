@@ -120,7 +120,7 @@ def _minimize_constrained(
     LOGGER.debug(f"Setting up constrained minimization for {input.dict()=}")
 
     # TODO: Pass this through
-    restrain_k = 1.0
+    restrain_k = 0.0
 
     # TODO: GAFF/Espaloma/local file/plugin force fields
 

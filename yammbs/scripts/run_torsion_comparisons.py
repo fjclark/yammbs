@@ -1,8 +1,13 @@
+"""Analyse torsion drive data using different force fields."""
+
 import pathlib
 from multiprocessing import freeze_support
 
 import click
 import numpy as np
+import pandas as pd
+import pingouin
+import seaborn as sns
 from matplotlib import pyplot
 from openff.toolkit import Molecule
 from rdkit.Chem import AllChem, Draw
@@ -19,7 +24,13 @@ pyplot.style.use("ggplot")
     "--base-force-fields",
     "-bf",
     multiple=True,
-    default=["openff-1.0.0", "openff-2.0.0", "openff-2.1.0", "openff-2.2.1"],
+    default=[
+        "openff-1.0.0",
+        "openff-2.0.0",
+        "openff-2.1.0",
+        "openff-2.2.0",
+        "openff-2.2.1",
+    ],
     help="List of force fields to use for optimization.",
 )
 @click.option(
@@ -68,9 +79,7 @@ def main(
     output_minimized: str,
     plot_dir: str,
 ) -> None:
-    """
-    Run torsion drive comparisons using specified force fields and input data.
-    """
+    """Run torsion drive comparisons using specified force fields and input data."""
     force_fields = base_force_fields + extra_force_fields
 
     dataset = QCArchiveTorsionDataset.model_validate_json(open(qcarchive_torsion_data).read())
@@ -99,10 +108,15 @@ def main(
     plot_cdfs(force_fields, output_metrics, plot_dir)
     plot_rms_stats(force_fields, output_metrics, plot_dir)
     plot_mean_error_distribution(force_fields, output_metrics, plot_dir)
-    plot_mean_js_divergence(force_fields, output_metrics, plot_dir)
+    plot_rms_js_distance(force_fields, output_metrics, plot_dir)
+    plot_violins_stats(force_fields, output_metrics, plot_dir)
+    plot_violin_js_distance(force_fields, output_metrics, plot_dir)
+    plot_paired_stats(force_fields, output_metrics, plot_dir)
+    plot_paired_js_distance(force_fields, output_metrics, plot_dir)
 
 
 def get_torsion_image(molecule_id: int, store: TorsionStore) -> pyplot.Figure:
+    """Plot the torsion image for a given molecule ID."""
     smiles = store.get_smiles_by_molecule_id(molecule_id)
     dihedral_indices = store.get_dihedral_indices_by_molecule_id(molecule_id)
 
@@ -116,7 +130,12 @@ def get_torsion_image(molecule_id: int, store: TorsionStore) -> pyplot.Figure:
     # Draw in 2D - compute 2D coordinates
     AllChem.Compute2DCoords(rdmol)
     # Highlight the dihedral
-    atom_indices = [dihedral_indices[0], dihedral_indices[1], dihedral_indices[2], dihedral_indices[3]]
+    atom_indices = [
+        dihedral_indices[0],
+        dihedral_indices[1],
+        dihedral_indices[2],
+        dihedral_indices[3],
+    ]
     bond_indices = [
         rdmol.GetBondBetweenAtoms(atom_indices[0], atom_indices[1]).GetIdx(),
         rdmol.GetBondBetweenAtoms(atom_indices[1], atom_indices[2]).GetIdx(),
@@ -137,6 +156,7 @@ def get_torsion_image(molecule_id: int, store: TorsionStore) -> pyplot.Figure:
 
 
 def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -> None:
+    """Plot the torsional energies for each molecule in the dataset."""
     n_rows = 8
     n_cols = 5
 
@@ -189,9 +209,6 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
             label="QM",
         )
 
-        # Viridis colormap for force fields, tuned to the length of the force fields
-        cmap = pyplot.get_cmap("viridis", len(force_fields))
-
         for force_field in force_fields:
             mm = dict(sorted(store.get_mm_energies_by_molecule_id(molecule_id, force_field=force_field).items()))
             if len(mm) == 0:
@@ -202,7 +219,7 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
                 [val - mm[qm_minimum_index] for val in mm.values()],
                 "o--",
                 label=force_field,
-                color=cmap(force_fields.index(force_field)),
+                #            color=cmap(force_fields.index(force_field)),
             )
 
         # Only add the axis if this is the last in the row - and add it off to the right
@@ -223,18 +240,20 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
         axes[row * 2 + 1, col].axis("off")
 
     fig.tight_layout()
-    fig.savefig(f"{plot_dir}/torsions.png")
+    fig.savefig(f"{plot_dir}/torsions.png", dpi=800)
 
 
 def plot_cdfs(force_fields: list[str], metrics_file: str, plot_dir: str):
+    """Plot the cumulative distribution functions for the RMSD, RMSE, and Jensen-Shannon distance."""
     metrics = MetricCollection.parse_file(metrics_file)
 
-    x_ranges = {"rmsd": (0, 0.14), "rmse": (-0.3, 5), "js_divergence": (None, None)}
+    # x_ranges = {"rmsd": (0, 0.14), "rmse": (-0.3, 5), "js_distance": (None, None)}
+    x_ranges = {"rmsd": (None, None), "rmse": (None, None), "js_distance": (None, None)}
 
     units = {
         "rmsd": r"$\mathrm{\AA}$",
         "rmse": r"kcal mol$^{-1}$",
-        "js_divergence": "",
+        "js_distance": "",
     }
 
     rmsds = {
@@ -247,20 +266,20 @@ def plot_cdfs(force_fields: list[str], metrics_file: str, plot_dir: str):
         for force_field in metrics.metrics.keys()
     }
 
-    js_divs = {
-        force_field: {key: val.js_divergence[0] for key, val in metrics.metrics[force_field].items()}
+    js_dists = {
+        force_field: {key: val.js_distance[0] for key, val in metrics.metrics[force_field].items()}
         for force_field in metrics.metrics.keys()
     }
 
-    js_div_temp = list(list(metrics.metrics.values())[0].values())[0].js_divergence[1]
+    js_div_temp = list(list(metrics.metrics.values())[0].values())[0].js_distance[1]
 
     data = {
         "rmsd": rmsds,
         "rmse": rmses,
-        "js_divergence": js_divs,
+        "js_distance": js_dists,
     }
-    for key in ["rmsd", "rmse", "js_divergence"]:
-        figure, axis = pyplot.subplots()
+    for key in ["rmsd", "rmse", "js_distance"]:
+        figure, axis = pyplot.subplots(figsize=(5, 4))
 
         for force_field in force_fields:
             if key == "dde":
@@ -290,8 +309,8 @@ def plot_cdfs(force_fields: list[str], metrics_file: str, plot_dir: str):
 
                 x_label = (
                     key.upper() + " / " + units[key]
-                    if key != "js_divergence"
-                    else f"Jensen-Shannon Divergence at {js_div_temp} K"
+                    if key != "js_distance"
+                    else f"Jensen-Shannon Distance at {js_div_temp} K"
                 )
                 axis.set_xlabel(x_label)
                 axis.set_ylabel("CDF")
@@ -299,15 +318,13 @@ def plot_cdfs(force_fields: list[str], metrics_file: str, plot_dir: str):
                 axis.set_xlim(x_ranges[key])
                 axis.set_ylim((-0.05, 1.05))
 
-        axis.legend(loc=0)
+        axis.legend(bbox_to_anchor=(1.05, 1), loc="upper left", borderaxespad=0)
 
-        figure.savefig(f"{plot_dir}/{key}.png", dpi=300)
+        figure.savefig(f"{plot_dir}/{key}.png", dpi=300, bbox_inches="tight")
 
 
 def get_rms(array: np.ndarray) -> float:
-    """
-    Calculate the root mean square of an array.
-    """
+    """Calculate the root mean square of an array."""
     return np.sqrt(np.mean(array**2))
 
 
@@ -316,6 +333,7 @@ def plot_rms_stats(
     metrics_file: str,
     plot_dir: str,
 ) -> None:
+    """Plot the RMS values for the RMSD and RMSE."""
     metrics = MetricCollection.parse_file(metrics_file)
 
     units = {
@@ -345,36 +363,237 @@ def plot_rms_stats(
         pyplot.xticks(rotation=90)
 
         # Save the figure
-        figure.tight_layout()
         figure.savefig(f"{plot_dir}/{key}_rms.png", dpi=300, bbox_inches="tight")
 
 
-def plot_mean_js_divergence(
+def plot_violins_stats(
     force_fields: list[str],
     metrics_file: str,
     plot_dir: str,
 ) -> None:
+    """Plot violin plots for the RMSD and RMSE."""
     metrics = MetricCollection.parse_file(metrics_file)
 
-    mean_js_divergences = {
-        force_field: np.mean([val.js_divergence[0] for val in metrics.metrics[force_field].values()])
+    rmses = {
+        force_field: np.array([val.rmse for val in metrics.metrics[force_field].values()])
         for force_field in force_fields
     }
 
-    js_div_temp = list(list(metrics.metrics.values())[0].values())[0].js_divergence[1]
+    rmsds = {
+        force_field: np.array([val.rmsd for val in metrics.metrics[force_field].values()])
+        for force_field in force_fields
+    }
 
-    # Plot mean JS divergence
+    units = {
+        "rmsd": r"$\mathrm{\AA}$",
+        "rmse": r"kcal mol$^{-1}$",
+    }
+
+    # Plot Seaborn violin plots
+    for key, data in zip(["rmsd", "rmse"], [rmsds, rmses]):
+        figure, axis = pyplot.subplots()
+
+        # Use different colors for each bar - the same as for the CDFs
+        sns.violinplot(
+            data=list(data.values()),
+            label=key,
+            ax=axis,
+            palette=pyplot.cm.tab10.colors,
+            density_norm="width",
+        )
+        axis.set_ylabel(key.upper() + " / " + units[key])
+
+        # Set x-ticks to be vertical
+        pyplot.xticks(rotation=90)
+
+        # Save the figure
+        figure.savefig(f"{plot_dir}/{key}_violin.png", dpi=300, bbox_inches="tight")
+
+
+def plot_paired_stats(
+    force_fields: list[str],
+    metrics_file: str,
+    plot_dir: str,
+) -> None:
+    """Plot paired statistics for the RMSD and RMSE."""
+    metrics = MetricCollection.parse_file(metrics_file)
+
+    units = {
+        "rmsd": r"$\mathrm{\AA}$",
+        "rmse": r"kcal mol$^{-1}$",
+    }
+
+    rmses = {
+        force_field: np.array([val.rmse for val in metrics.metrics[force_field].values()])
+        for force_field in force_fields
+    }
+
+    rmsds = {
+        force_field: np.array([val.rmsd for val in metrics.metrics[force_field].values()])
+        for force_field in force_fields
+    }
+
+    # Plot paired statistics with pinguoin.plot_paired
+    for key, data in zip(["rmsd", "rmse"], [rmsds, rmses]):
+        # Small figure
+        figure, axis = pyplot.subplots(figsize=(5, 4))
+
+        # Make a DataFrame for pingouin. There should be n_force_fields entires for each molecule
+        colums = ["index", key, "force_field"]
+        entries = []
+        for force_field in data:
+            for index, value in enumerate(data[force_field]):
+                entries.append([index, value, force_field])
+
+        df = pd.DataFrame(entries, columns=colums)
+
+        pingouin.plot_paired(
+            data=df,
+            dv=key,
+            within="force_field",
+            subject="index",
+        )
+
+        # Compute Wilcoxon signed-rank test and add results to the plot
+        results = pingouin.wilcoxon(
+            x=df[df["force_field"] == force_fields[0]][key],
+            y=df[df["force_field"] == force_fields[1]][key],
+            alternative="two-sided",
+        )
+
+        # Add the results to the plot
+        axis.text(
+            0.5,
+            0.95,
+            f"Wilcoxon signed-rank test: $p$ = {results['p-val'].values[0]:.3e}",
+            transform=axis.transAxes,
+            ha="center",
+            va="top",
+        )
+
+        axis.set_ylabel(key.upper() + " / " + units[key])
+
+        # Set x-ticks to be vertical
+        pyplot.xticks(rotation=90)
+
+        # Save the figure
+        figure.savefig(f"{plot_dir}/{key}_paired.png", dpi=500, bbox_inches="tight")
+
+
+def plot_rms_js_distance(
+    force_fields: list[str],
+    metrics_file: str,
+    plot_dir: str,
+) -> None:
+    """Plot the RMS JS distance for each force field."""
+    metrics = MetricCollection.parse_file(metrics_file)
+
+    rms_js_distance = {
+        force_field: get_rms(np.array([val.js_distance[0] for val in metrics.metrics[force_field].values()]))
+        for force_field in force_fields
+    }
+
+    js_div_temp = list(list(metrics.metrics.values())[0].values())[0].js_distance[1]
+
+    # Plot mean JS distance
     figure, axis = pyplot.subplots()
 
-    axis.bar(mean_js_divergences.keys(), mean_js_divergences.values(), color=pyplot.cm.tab10.colors)
-    axis.set_ylabel(f"Mean Jensen-Shannon Divergence at {js_div_temp} K")
+    axis.bar(rms_js_distance.keys(), rms_js_distance.values(), color=pyplot.cm.tab10.colors)
+    axis.set_ylabel(f"RMS Jensen-Shannon Distance at {js_div_temp} K")
 
     # Set x-ticks to be vertical
     pyplot.xticks(rotation=90)
 
     # Save the figure
-    figure.tight_layout()
-    figure.savefig(f"{plot_dir}/mean_js_divergence.png", dpi=300, bbox_inches="tight")
+    figure.savefig(f"{plot_dir}/rms_js_distance.png", dpi=300, bbox_inches="tight")
+
+
+def plot_violin_js_distance(
+    force_fields: list[str],
+    metrics_file: str,
+    plot_dir: str,
+) -> None:
+    """Plot violin plots for the Jensen-Shannon distance."""
+    metrics = MetricCollection.parse_file(metrics_file)
+
+    js_dists = {
+        force_field: np.array([val.js_distance[0] for val in metrics.metrics[force_field].values()])
+        for force_field in force_fields
+    }
+
+    # Plot Seaborn violin plots
+    figure, axis = pyplot.subplots()
+
+    sns.violinplot(
+        data=list(js_dists.values()),
+        ax=axis,
+        palette=pyplot.cm.tab10.colors,
+        density_norm="width",
+    )
+    axis.set_ylabel("Jensen-Shannon Distance")
+
+    # Set x-ticks to be vertical
+    pyplot.xticks(rotation=90)
+
+    # Save the figure
+    figure.savefig(f"{plot_dir}/js_distance_violin.png", dpi=300, bbox_inches="tight")
+
+
+def plot_paired_js_distance(
+    force_fields: list[str],
+    metrics_file: str,
+    plot_dir: str,
+) -> None:
+    """Plot paired statistics for the Jensen-Shannon distance."""
+    metrics = MetricCollection.parse_file(metrics_file)
+
+    js_dists = {
+        force_field: np.array([val.js_distance[0] for val in metrics.metrics[force_field].values()])
+        for force_field in force_fields
+    }
+
+    # Plot paired statistics with pingouin.plot_paired
+    figure, axis = pyplot.subplots()
+
+    # Make a DataFrame for pingouin. There should be n_force_fields entires for each molecule
+    colums = ["index", "js_distance", "force_field"]
+    entries = []
+    for force_field in js_dists:
+        for index, value in enumerate(js_dists[force_field]):
+            entries.append([index, value, force_field])
+
+    df = pd.DataFrame(entries, columns=colums)
+
+    pingouin.plot_paired(
+        data=df,
+        dv="js_distance",
+        within="force_field",
+        subject="index",
+    )
+
+    axis.set_ylabel("Jensen-Shannon Distance")
+
+    # Compute Wilcoxon signed-rank test and add results to the plot
+    results = pingouin.wilcoxon(
+        x=df[df["force_field"] == force_fields[0]]["js_distance"],
+        y=df[df["force_field"] == force_fields[1]]["js_distance"],
+        alternative="two-sided",
+    )
+    # Add the results to the plot
+    axis.text(
+        0.5,
+        0.95,
+        f"Wilcoxon signed-rank test: $p$ = {results['p-val'].values[0]:.3e}",
+        transform=axis.transAxes,
+        ha="center",
+        va="top",
+    )
+
+    # Set x-ticks to be vertical
+    pyplot.xticks(rotation=90)
+
+    # Save the figure
+    figure.savefig(f"{plot_dir}/js_distance_paired.png", dpi=300, bbox_inches="tight")
 
 
 def plot_mean_error_distribution(
@@ -382,6 +601,7 @@ def plot_mean_error_distribution(
     metrics_file: str,
     plot_dir: str,
 ) -> None:
+    """Plot the distribution of mean errors for each force field."""
     metrics = MetricCollection.parse_file(metrics_file)
 
     units = {
@@ -393,7 +613,7 @@ def plot_mean_error_distribution(
         for force_field in force_fields
     }
     # Plot mean error distribution using kernel density estimation
-    figure, axis = pyplot.subplots()
+    figure, axis = pyplot.subplots(figsize=(10, 4))
     import seaborn as sns
 
     for force_field in mean_errors.keys():
@@ -404,7 +624,7 @@ def plot_mean_error_distribution(
         )
     axis.set_xlabel("Mean Error / " + units["mean_error"])
     axis.set_ylabel("Density")
-    axis.legend(loc=0)
+    axis.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
 
     # Save the figure
     figure.tight_layout()

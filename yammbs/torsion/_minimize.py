@@ -108,8 +108,7 @@ class ConstrainedMinimizationError(Exception):
 def _minimize_constrained(
     input: ConstrainedMinimizationInput,
 ) -> ConstrainedMinimizationResult:
-    """
-    Taken from openff-strike-team 10/31/24
+    """Taken from openff-strike-team 10/31/24.
 
     https://github.com/lilyminium/openff-strike-team/blob/a6ccd2821ed627064529f5c4a22b47c1fa36efe2/torsions/datasets/mm/minimize-torsion-constrained.py#L35-L106
     """
@@ -121,7 +120,7 @@ def _minimize_constrained(
     LOGGER.debug(f"Setting up constrained minimization for {input.dict()=}")
 
     # TODO: Pass this through
-    restrain_k = 1.0
+    restrain_k = 0.0
 
     # TODO: GAFF/Espaloma/local file/plugin force fields
 

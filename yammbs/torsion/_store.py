@@ -14,7 +14,6 @@ from typing_extensions import Self
 from yammbs._minimize import _shorthand_to_full_force_field_name
 from yammbs._molecule import _smiles_to_inchi_key
 from yammbs._types import Pathlike
-from yammbs.analysis import get_rmsd
 from yammbs.exceptions import DatabaseExistsError
 from yammbs.torsion._db import (
     DBBase,
@@ -25,10 +24,8 @@ from yammbs.torsion._db import (
 from yammbs.torsion._session import TorsionDBSessionManager
 from yammbs.torsion.analysis import (
     RMSD,
-    RMSE,
-    JSDivergence,
-    JSDivergenceCollection,
-    MeanError,
+    AnalysisMetricCollectionTypeVar,
+    JSDistanceCollection,
     MeanErrorCollection,
     RMSDCollection,
     RMSECollection,
@@ -54,7 +51,7 @@ class TorsionStore:
                 f"Only paths to SQLite databases ending in .sqlite are supported. Given: {database_path}",
             )
 
-        LOGGER.info("Creating a new TorsionStore at {database_path=}")
+        LOGGER.info(f"Creating a new TorsionStore at {database_path=}")
 
         self.database_url = f"sqlite:///{database_path.resolve()}"
         self.engine = create_engine(self.database_url)
@@ -111,8 +108,7 @@ class TorsionStore:
             db.store_mm_torsion_point(point)
 
     def get_molecule_ids(self) -> list[int]:
-        """
-        Get the molecule IDs of all records in the store.
+        """Get the molecule IDs of all records in the store.
 
         These are likely to be integers sequentially incrementing from 1, but that
         is not guaranteed.
@@ -384,16 +380,55 @@ class TorsionStore:
                 self.get_smiles_by_molecule_id(molecule_id),
                 allow_undefined_stereo=True,
             )
-            rmsd_vals = numpy.array([get_rmsd(molecule, qm_points[key], mm_points[key]) for key in qm_points])
 
-            rmsds.append(
-                RMSD(
-                    id=molecule_id,
-                    rmsd=numpy.sqrt((rmsd_vals**2).mean()),
+            rmsds.append(RMSD.from_data(molecule_id, molecule, qm_points, mm_points))
+
+        return rmsds
+
+    def _get_energy_based_metric(
+        self,
+        force_field: str,
+        analysis_metric_collection: type[AnalysisMetricCollectionTypeVar],
+        molecule_ids: list[int] | None = None,
+        skip_check: bool = False,
+        kwargs: dict | None = None,
+    ) -> AnalysisMetricCollectionTypeVar:
+        """Calculate energy-based metrics for the supplied analysis metric collection."""
+        kwargs = kwargs if kwargs else dict()
+
+        if not molecule_ids:
+            molecule_ids = self.get_molecule_ids()
+
+        if not skip_check:
+            self.optimize_mm(force_field=force_field)
+
+        collection = analysis_metric_collection()
+
+        for molecule_id in molecule_ids:
+            qm, mm = (
+                numpy.fromiter(dct.values(), dtype=float)
+                for dct in _normalize(
+                    self.get_qm_energies_by_molecule_id(id=molecule_id),
+                    self.get_mm_energies_by_molecule_id(id=molecule_id, force_field=force_field),
+                )
+            )
+
+            if len(mm) * len(qm) == 0:
+                LOGGER.warning(
+                    "Missing QM OR MM data for this no mm data, returning empty dicts; \n\t"
+                    f"{molecule_id=}, {force_field=}, {len(qm)=}, {len(mm)=}",
+                )
+
+            collection.append(
+                collection.get_item_type().from_data(
+                    molecule_id=molecule_id,
+                    qm_energies=qm,
+                    mm_energies=mm,
+                    **kwargs,
                 ),
             )
 
-        return rmsds
+        return collection
 
     def get_rmse(
         self,
@@ -401,39 +436,13 @@ class TorsionStore:
         molecule_ids: list[int] | None = None,
         skip_check: bool = False,
     ) -> RMSECollection:
-        """Get the vector norm of the energy errors over the torsion profile."""
-
-        if not molecule_ids:
-            molecule_ids = self.get_molecule_ids()
-
-        if not skip_check:
-            self.optimize_mm(force_field=force_field)
-
-        rmses = RMSECollection()
-
-        for molecule_id in molecule_ids:
-            qm, mm = (
-                numpy.fromiter(dct.values(), dtype=float)
-                for dct in _normalize(
-                    self.get_qm_energies_by_molecule_id(id=molecule_id),
-                    self.get_mm_energies_by_molecule_id(id=molecule_id, force_field=force_field),
-                )
-            )
-
-            if len(mm) * len(qm) == 0:
-                LOGGER.warning(
-                    "Missing QM OR MM data for this no mm data, returning empty dicts; \n\t"
-                    f"{molecule_id=}, {force_field=}, {len(qm)=}, {len(mm)=}",
-                )
-
-            rmses.append(
-                RMSE(
-                    id=molecule_id,
-                    rmse=numpy.sqrt(((qm - mm) ** 2).mean()),
-                ),
-            )
-
-        return rmses
+        """Get the RMS RMSD over the torsion profile."""
+        return self._get_energy_based_metric(
+            force_field=force_field,
+            analysis_metric_collection=RMSECollection,
+            molecule_ids=molecule_ids,
+            skip_check=skip_check,
+        )
 
     def get_mean_error(
         self,
@@ -441,103 +450,28 @@ class TorsionStore:
         molecule_ids: list[int] | None = None,
         skip_check: bool = False,
     ) -> MeanErrorCollection:
-        """Get the vector norm of the energy errors over the torsion profile."""
+        return self._get_energy_based_metric(
+            force_field=force_field,
+            analysis_metric_collection=MeanErrorCollection,
+            molecule_ids=molecule_ids,
+            skip_check=skip_check,
+        )
 
-        if not molecule_ids:
-            molecule_ids = self.get_molecule_ids()
-
-        if not skip_check:
-            self.optimize_mm(force_field=force_field)
-
-        mean_errors = MeanErrorCollection()
-
-        for molecule_id in molecule_ids:
-            qm, mm = (
-                numpy.fromiter(dct.values(), dtype=float)
-                for dct in _normalize(
-                    self.get_qm_energies_by_molecule_id(id=molecule_id),
-                    self.get_mm_energies_by_molecule_id(id=molecule_id, force_field=force_field),
-                )
-            )
-
-            if len(mm) * len(qm) == 0:
-                LOGGER.warning(
-                    "Missing QM OR MM data for this no mm data, returning empty dicts; \n\t"
-                    f"{molecule_id=}, {force_field=}, {len(qm)=}, {len(mm)=}",
-                )
-
-            mean_errors.append(
-                MeanError(
-                    id=molecule_id,
-                    mean_error=numpy.mean(mm - qm),
-                ),
-            )
-
-        return mean_errors
-
-    def _get_js_divergence(
-        self,
-        qm: numpy.ndarray,
-        mm: numpy.ndarray,
-        temperature: float = 500.0,
-    ) -> float:
-        """Return the Jensen-Shannon divergence between two distributions."""
-        from scipy.spatial.distance import jensenshannon
-
-        beta = 1.0 / (temperature * 0.0019872041)  # kcal/mol to K
-
-        # Get normalised probabilities by Boltzmann inversion
-        p_qm, p_mm = numpy.exp(-beta * qm), numpy.exp(-beta * mm)
-        p_qm /= p_qm.sum()
-        p_mm /= p_mm.sum()
-
-        # Return square as scipy gives us the sqrt of the divergence
-        return jensenshannon(p_qm, p_mm) ** 2
-
-    def get_js_divergence(
+    def get_js_distance(
         self,
         force_field: str,
-        temperature: float = 500.0,
         molecule_ids: list[int] | None = None,
         skip_check: bool = False,
-    ) -> JSDivergenceCollection:
-        """
-        Compute the Jensen-Shannon divergence between the QM and MM profiles"
-        by treating the potentials as potentials of mean force and performing"
-        Boltzmann inversion.
-        """
-        if not molecule_ids:
-            molecule_ids = self.get_molecule_ids()
-
-        if not skip_check:
-            self.optimize_mm(force_field=force_field)
-
-        divergences = JSDivergenceCollection()
-
-        for molecule_id in molecule_ids:
-            qm, mm = (
-                numpy.fromiter(dct.values(), dtype=float)
-                for dct in _normalize(
-                    self.get_qm_energies_by_molecule_id(id=molecule_id),
-                    self.get_mm_energies_by_molecule_id(id=molecule_id, force_field=force_field),
-                )
-            )
-
-            if len(mm) * len(qm) == 0:
-                LOGGER.warning(
-                    "Missing QM OR MM data for this no mm data, returning empty dicts; \n\t"
-                    f"{molecule_id=}, {force_field=}, {len(qm)=}, {len(mm)=}",
-                )
-
-            divergences.append(
-                JSDivergence(
-                    id=molecule_id,
-                    js_divergence=self._get_js_divergence(qm=qm, mm=mm, temperature=temperature),
-                    temperature=temperature,
-                ),
-            )
-
-        return divergences
+        temperature: float = 500.0,
+    ) -> JSDistanceCollection:
+        """Get the RMS RMSD over the torsion profile."""
+        return self._get_energy_based_metric(
+            force_field=force_field,
+            analysis_metric_collection=JSDistanceCollection,
+            molecule_ids=molecule_ids,
+            skip_check=skip_check,
+            kwargs={"temperature": temperature},
+        )
 
     def get_outputs(self) -> MinimizedTorsionDataset:
         from yammbs.torsion.outputs import MinimizedTorsionProfile
@@ -592,9 +526,9 @@ class TorsionStore:
             rmses = self.get_rmse(force_field=force_field, skip_check=True).to_dataframe()
             rmsds = self.get_rmsd(force_field=force_field, skip_check=True).to_dataframe()
             mean_errors = self.get_mean_error(force_field=force_field, skip_check=True).to_dataframe()
-            js_divergences = self.get_js_divergence(force_field=force_field, skip_check=True).to_dataframe()
+            js_distances = self.get_js_distance(force_field=force_field, skip_check=True).to_dataframe()
 
-            dataframe = rmses.join(rmsds).join(mean_errors).join(js_divergences)
+            dataframe = rmses.join(rmsds).join(mean_errors).join(js_distances)
 
             dataframe = dataframe.replace({pandas.NA: numpy.nan})
 
@@ -603,7 +537,7 @@ class TorsionStore:
                     rmsd=row["rmsd"],
                     rmse=row["rmse"],
                     mean_error=row["mean_error"],
-                    js_divergence=(row["js_divergence"], row["temperature"]),
+                    js_distance=(row["js_distance"], row["js_temperature"]),
                 )
                 for id, row in dataframe.iterrows()
             }
@@ -642,9 +576,7 @@ class TorsionStore:
         return matched_dihedrals
 
     def get_torsion_image(self, molecule_id: int) -> str:
-        """
-        Get an image of the molecule with the dihedral highlighted.
-        """
+        """Get an image of the molecule with the dihedral highlighted."""
         from openff.toolkit import Molecule
         from rdkit.Chem import AllChem
         from rdkit.Chem.Draw import rdMolDraw2D
@@ -763,8 +695,7 @@ class TorsionStore:
         force_fields: list[str],
         show_parameters: bool = False,
     ) -> ForwardRef("pd.Dataframe"):
-        """
-        Get a summary dataframe of the metrics for a given force field.
+        """Get a summary dataframe of the metrics for a given force field.
 
         Parameters
         ----------
@@ -778,6 +709,7 @@ class TorsionStore:
         -------
         pd.DataFrame
             A dataframe containing the summary of the metrics for the given force fields.
+
         """
         import pandas as pd
         from tqdm import tqdm
@@ -821,9 +753,7 @@ class TorsionStore:
         force_fields: list[str] | None = None,
         show_parameters: bool = False,
     ) -> None:
-        """
-        Create a html summary of the metrics for a given force field.
-        """
+        """Create a html summary of the metrics for a given force field."""
         import bokeh
         import panel
 

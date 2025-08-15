@@ -82,7 +82,8 @@ def main(
     """Run torsion drive comparisons using specified force fields and input data."""
     force_fields = base_force_fields + extra_force_fields
 
-    dataset = QCArchiveTorsionDataset.model_validate_json(open(qcarchive_torsion_data).read())
+    with open(qcarchive_torsion_data) as f:
+        dataset = QCArchiveTorsionDataset.model_validate_json(f.read())
 
     if pathlib.Path(database_file).exists():
         store = TorsionStore(database_file)
@@ -115,10 +116,10 @@ def main(
     plot_paired_js_distance(force_fields, output_metrics, plot_dir)
 
 
-def get_torsion_image(molecule_id: int, store: TorsionStore) -> pyplot.Figure:
-    """Plot the torsion image for a given molecule ID."""
-    smiles = store.get_smiles_by_molecule_id(molecule_id)
-    dihedral_indices = store.get_dihedral_indices_by_molecule_id(molecule_id)
+def get_torsion_image(torsion_id: int, store: TorsionStore) -> pyplot.Figure:
+    """Plot the torsion image for a given torsion ID."""
+    smiles = store.get_smiles_by_torsion_id(torsion_id)
+    dihedral_indices = store.get_dihedral_indices_by_torsion_id(torsion_id)
 
     # Use the mapped SMILES to get the molecule
     mol = Molecule.from_mapped_smiles(smiles, allow_undefined_stereo=True)
@@ -161,7 +162,7 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
     n_cols = 5
 
     # Adjust number of rows and columns down if we have fewer than 40 molecules
-    n_molecules = len(store.get_molecule_ids())
+    n_molecules = len(store.get_torsion_ids())
     if n_molecules * 2 < n_rows * n_cols:
         n_rows = n_molecules // n_cols
         if n_molecules % n_cols != 0:
@@ -172,7 +173,7 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
 
     fig, axes = pyplot.subplots(n_rows, n_cols, figsize=(n_cols * 5, n_rows * 4))
 
-    for i, molecule_id in enumerate(store.get_molecule_ids()):
+    for i, torsion_id in enumerate(store.get_torsion_ids()):
         # Draw the molecule on the upper axis and the torsion plot on the lower axis
         if i >= n_torsions:
             break
@@ -184,12 +185,12 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
         torsion_axis = axes[row * 2 + 1, col]
 
         # Draw the molecule
-        image_axis.imshow(get_torsion_image(molecule_id, store))
+        image_axis.imshow(get_torsion_image(torsion_id, store))
         image_axis.axis("off")
 
         # Plot the torsion data
-        torsion_axis.set_title(f"ID: {molecule_id}")
-        _qm = store.get_qm_energies_by_molecule_id(molecule_id)
+        torsion_axis.set_title(f"ID: {torsion_id}")
+        _qm = store.get_qm_energies_by_torsion_id(torsion_id)
 
         _qm = dict(sorted(_qm.items()))
 
@@ -210,7 +211,7 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
         )
 
         for force_field in force_fields:
-            mm = dict(sorted(store.get_mm_energies_by_molecule_id(molecule_id, force_field=force_field).items()))
+            mm = dict(sorted(store.get_mm_energies_by_torsion_id(torsion_id, force_field=force_field).items()))
             if len(mm) == 0:
                 continue
 
@@ -219,7 +220,6 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
                 [val - mm[qm_minimum_index] for val in mm.values()],
                 "o--",
                 label=force_field,
-                #            color=cmap(force_fields.index(force_field)),
             )
 
         # Only add the axis if this is the last in the row - and add it off to the right
@@ -240,15 +240,14 @@ def plot_torsions(plot_dir: str, force_fields: list[str], store: TorsionStore) -
         axes[row * 2 + 1, col].axis("off")
 
     fig.tight_layout()
-    fig.savefig(f"{plot_dir}/torsions.png", dpi=800)
+    fig.savefig(f"{plot_dir}/torsions.png", dpi=300, bbox_inches="tight")
 
 
 def plot_cdfs(force_fields: list[str], metrics_file: str, plot_dir: str):
     """Plot the cumulative distribution functions for the RMSD, RMSE, and Jensen-Shannon distance."""
     metrics = MetricCollection.parse_file(metrics_file)
 
-    # x_ranges = {"rmsd": (0, 0.14), "rmse": (-0.3, 5), "js_distance": (None, None)}
-    x_ranges = {"rmsd": (None, None), "rmse": (None, None), "js_distance": (None, None)}
+    x_ranges = {"rmsd": (0, 0.14), "rmse": (-0.3, 5), "js_distance": (None, None)}
 
     units = {
         "rmsd": r"$\mathrm{\AA}$",
@@ -279,7 +278,7 @@ def plot_cdfs(force_fields: list[str], metrics_file: str, plot_dir: str):
         "js_distance": js_dists,
     }
     for key in ["rmsd", "rmse", "js_distance"]:
-        figure, axis = pyplot.subplots(figsize=(5, 4))
+        figure, axis = pyplot.subplots()
 
         for force_field in force_fields:
             if key == "dde":
@@ -318,7 +317,7 @@ def plot_cdfs(force_fields: list[str], metrics_file: str, plot_dir: str):
                 axis.set_xlim(x_ranges[key])
                 axis.set_ylim((-0.05, 1.05))
 
-        axis.legend(bbox_to_anchor=(1.05, 1), loc="upper left", borderaxespad=0)
+        axis.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
 
         figure.savefig(f"{plot_dir}/{key}.png", dpi=300, bbox_inches="tight")
 

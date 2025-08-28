@@ -618,7 +618,6 @@ class TorsionStore:
         torsion_id: int,
         force_fields: list[str] | None = None,
     ) -> str:
-        import numpy as np
         from matplotlib import pyplot as plt
 
         # Create plot
@@ -632,10 +631,6 @@ class TorsionStore:
         # Make a new dict to avoid in-place modification while iterating
         qm = {key: _qm[key] - _qm[qm_minimum_index] for key in _qm}
 
-        # Assume a default grid spacing of 15 degrees (BespokeFit default)
-        angles = np.arange(-165, 195, 15)
-        assert len(angles) == len(qm), "QM data and angles should match in length"
-
         torsion_axis.plot(
             qm.keys(),
             qm.values(),
@@ -645,11 +640,12 @@ class TorsionStore:
 
         for force_field in force_fields:
             mm = dict(sorted(self.get_mm_energies_by_torsion_id(torsion_id, force_field=force_field).items()))
+            assert mm.keys() == qm.keys(), "MM data and QM data should have the same keys"
             if len(mm) == 0:
                 continue
 
             torsion_axis.plot(
-                angles,
+                mm.keys(),
                 [val - mm[qm_minimum_index] for val in mm.values()],
                 "o--",
                 label=force_field,
@@ -709,7 +705,7 @@ class TorsionStore:
             "RMSD / A": lambda x: x.rmsd,
             "RMSE / kcal mol-1": lambda x: x.rmse,
             "Mean Error / kcal mol-1": lambda x: x.mean_error,
-            "JS Divergence": lambda x: x.js_divergence[0],
+            "JS Distance": lambda x: x.js_distance[0],
         }
 
         for mol_id in tqdm(self.get_torsion_ids()):

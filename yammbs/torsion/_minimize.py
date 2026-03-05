@@ -104,6 +104,7 @@ def _minimize_torsions(
     n_processes: int = 2,
     chunksize=32,
     restraint_k: float = 0.0,
+    maxtasksperchild: int | None = 100,
 ) -> Generator[ConstrainedMinimizationResult, None, None]:
     LOGGER.info("Mapping `data` generator into `inputs` generator")
 
@@ -134,7 +135,9 @@ def _minimize_torsions(
 
     # TODO: It'd be nice to have the `total` argument passed through, but that would require using
     #       a list-like iterable instead of a generator, which might cause problems at scale
-    with Pool(processes=n_processes) as pool:
+    # maxtasksperchild recycles workers after N tasks, causing the OS to reclaim their
+    # GPU memory. This is the most reliable way to bound CUDA memory growth in long runs.
+    with Pool(processes=n_processes, maxtasksperchild=maxtasksperchild) as pool:
         for val in tqdm(
             pool.imap(
                 _run_minimization_constrained,

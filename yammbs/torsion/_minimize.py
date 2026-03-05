@@ -307,55 +307,60 @@ def _minimize_openmm_torsion_restrained(
     context = openmm.Context(
         system,
         openmm.VerletIntegrator(0.1 * openmm.unit.femtoseconds),
-        openmm.Platform.getPlatformByName("Reference"),
+        openmm.Platform.getPlatformByName("CUDA"),
     )
 
-    context.setPositions(
-        (positions * openmm.unit.angstrom).in_units_of(openmm.unit.nanometer),
-    )
-    context.computeVirtualSites()
+    try:
+        context.setPositions(
+            (positions * openmm.unit.angstrom).in_units_of(openmm.unit.nanometer),
+        )
+        context.computeVirtualSites()
 
-    # Sanity check: verify the initial dihedral angle
-    u_initial = mda.Universe.empty(n_atoms=len(positions), trajectory=True)
-    u_initial.load_new(positions, order="fac")
+        # Sanity check: verify the initial dihedral angle
+        u_initial = mda.Universe.empty(n_atoms=len(positions), trajectory=True)
+        u_initial.load_new(positions, order="fac")
 
-    dihedral_calc_initial = Dihedral([u_initial.atoms[list(dihedral_indices)]])
-    dihedral_calc_initial.run()
-    initial_angle = dihedral_calc_initial.results.angles[0][0]
+        dihedral_calc_initial = Dihedral([u_initial.atoms[list(dihedral_indices)]])
+        dihedral_calc_initial.run()
+        initial_angle = dihedral_calc_initial.results.angles[0][0]
 
-    # Calculate initial angle difference accounting for periodicity
-    initial_angle_diff = abs(initial_angle - angle)
-    if initial_angle_diff > 180.0:
-        initial_angle_diff = 360.0 - initial_angle_diff
+        # Calculate initial angle difference accounting for periodicity
+        initial_angle_diff = abs(initial_angle - angle)
+        if initial_angle_diff > 180.0:
+            initial_angle_diff = 360.0 - initial_angle_diff
 
-    LOGGER.info(
-        f"Initial dihedral angle: {initial_angle:.2f}° (target: {angle:.2f}°, diff: {initial_angle_diff:.2f}°)",
-    )
+        LOGGER.info(
+            f"Initial dihedral angle: {initial_angle:.2f}° (target: {angle:.2f}°, diff: {initial_angle_diff:.2f}°)",
+        )
 
-    # Log initial energy (excluding restraint)
-    groups_mask = sum(1 << group for group in range(32) if group != restraint_force_group)
-    initial_energy = (
-        context.getState(getEnergy=True, groups=groups_mask)
-        .getPotentialEnergy()
-        .value_in_unit(openmm.unit.kilocalorie_per_mole)
-    )
-    LOGGER.info(f"Initial energy (excluding restraint): {initial_energy} kcal/mol")
+        # Log initial energy (excluding restraint)
+        groups_mask = sum(1 << group for group in range(32) if group != restraint_force_group)
+        initial_energy = (
+            context.getState(getEnergy=True, groups=groups_mask)
+            .getPotentialEnergy()
+            .value_in_unit(openmm.unit.kilocalorie_per_mole)
+        )
+        LOGGER.info(f"Initial energy (excluding restraint): {initial_energy} kcal/mol")
 
-    # Minimize (restraint is active during minimization)
-    openmm.LocalEnergyMinimizer.minimize(
-        context=context,
-        tolerance=_DEFAULT_ENERGY_MINIMIZATION_TOLERANCE.to_openmm(),
-        maxIterations=_DEFAULT_ENERGY_MINIMIZATION_MAX_ITERATIONS,
-    )
+        # Minimize (restraint is active during minimization)
+        openmm.LocalEnergyMinimizer.minimize(
+            context=context,
+            tolerance=_DEFAULT_ENERGY_MINIMIZATION_TOLERANCE.to_openmm(),
+            maxIterations=_DEFAULT_ENERGY_MINIMIZATION_MAX_ITERATIONS,
+        )
 
-    # Get final state excluding restraint force group
-    final_state = context.getState(getPositions=True, getEnergy=True, groups=groups_mask)
+        # Get final state excluding restraint force group
+        final_state = context.getState(getPositions=True, getEnergy=True, groups=groups_mask)
 
-    final_positions = final_state.getPositions(asNumpy=True).value_in_unit(openmm.unit.angstrom)
+        final_positions = final_state.getPositions(asNumpy=True).value_in_unit(openmm.unit.angstrom)
 
-    final_energy = final_state.getPotentialEnergy().value_in_unit(openmm.unit.kilocalorie_per_mole)
+        final_energy = final_state.getPotentialEnergy().value_in_unit(openmm.unit.kilocalorie_per_mole)
 
-    LOGGER.info(f"Final energy (excluding restraint): {final_energy} kcal/mol")
+        LOGGER.info(f"Final energy (excluding restraint): {final_energy} kcal/mol")
+    finally:
+        # Explicitly delete the Context to release GPU memory immediately,
+        # rather than waiting for CPython's garbage collector.
+        del context
 
     # Sanity check: verify the final dihedral angle matches the target
     u_final = mda.Universe.empty(n_atoms=len(final_positions), trajectory=True)

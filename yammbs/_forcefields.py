@@ -1,3 +1,4 @@
+import copy
 import functools
 import logging
 import re
@@ -126,11 +127,31 @@ NON_SMIRNOFF_SYSTEM_BUILDERS = {
     "espaloma": _espaloma,
 }
 
+_omm_system_cache: dict[tuple[str, str], openmm.System] = {}
+
 
 def build_omm_system(force_field: str, molecule: Molecule) -> openmm.System:
     """Get an OpenMM System for a given force field and molecule."""
-    for prefix, builder in NON_SMIRNOFF_SYSTEM_BUILDERS.items():
-        if force_field.startswith(prefix):
-            return builder(molecule, force_field)
+    if molecule._conformers is not None:
+        raise ValueError(
+            "Molecule must not have conformers when building a cached OpenMM system, "
+            "as conformers are not included in the cache key.",
+        )
+    if molecule._partial_charges is not None:
+        raise ValueError(
+            "Molecule must not have partial charges when building a cached OpenMM system, "
+            "as partial charges are not included in the cache key.",
+        )
 
-    return _smirnoff(molecule, force_field)
+    smiles = molecule.to_smiles(isomeric=True, explicit_hydrogens=True)
+    cache_key = (force_field, smiles)
+
+    if cache_key not in _omm_system_cache:
+        for prefix, builder in NON_SMIRNOFF_SYSTEM_BUILDERS.items():
+            if force_field.startswith(prefix):
+                _omm_system_cache[cache_key] = builder(molecule, force_field)
+                break
+        else:
+            _omm_system_cache[cache_key] = _smirnoff(molecule, force_field)
+
+    return copy.deepcopy(_omm_system_cache[cache_key])

@@ -1,5 +1,6 @@
 import logging
 from collections.abc import Callable, Generator
+from gc import collect
 from multiprocessing import Pool
 from typing import Literal
 
@@ -47,6 +48,33 @@ def _get_openmm_platform_name(force_field: str) -> str:
     if _is_aceff_force_field(force_field):
         return "CUDA"
     return "Reference"
+
+
+def _cleanup_openmm_resources(
+    context: openmm.Context | None = None,
+    integrator: openmm.Integrator | None = None,
+    platform_name: str = "Reference",
+) -> None:
+    if context is not None:
+        del context
+
+    if integrator is not None:
+        del integrator
+
+    collect()
+
+    if platform_name.casefold() != "cuda":
+        return
+
+    try:
+        import torch
+    except ImportError:
+        LOGGER.debug("PyTorch is not installed; skipping torch.cuda cleanup.")
+        return
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
 
 class ConstrainedMinimizationInput(ImmutableModel):
@@ -341,9 +369,13 @@ def _minimize_openmm_torsion_restrained(
 
     # Perform minimization with custom energy evaluation
     # that excludes the restraint force group
+    context = None
+    integrator = None
+
+    integrator = openmm.VerletIntegrator(0.1 * openmm.unit.femtoseconds)
     context = openmm.Context(
         system,
-        openmm.VerletIntegrator(0.1 * openmm.unit.femtoseconds),
+        integrator,
         openmm.Platform.getPlatformByName(platform_name),
     )
 
@@ -395,9 +427,11 @@ def _minimize_openmm_torsion_restrained(
 
         LOGGER.info(f"Final energy (excluding restraint): {final_energy} kcal/mol")
     finally:
-        # Explicitly delete the Context to release GPU memory immediately,
-        # rather than waiting for CPython's garbage collector.
-        del context
+        _cleanup_openmm_resources(
+            context=context,
+            integrator=integrator,
+            platform_name=platform_name,
+        )
 
     # Sanity check: verify the final dihedral angle matches the target
     u_final = mda.Universe.empty(n_atoms=len(final_positions), trajectory=True)

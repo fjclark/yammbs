@@ -15,6 +15,9 @@ from yammbs.torsion._minimize import (
     _POSITIONAL_RESTRAINT_FORCE_GROUP,
     ConstrainedMinimizationInput,
     ConstrainedMinimizationResult,
+    _get_openmm_platform_name,
+    _is_aceff_force_field,
+    _minimize_torsions,
     _restrain_omm_system,
     _run_minimization_constrained,
 )
@@ -191,6 +194,73 @@ def test_minimization_registry_complete():
     # Verify all values are callable
     for method, func in _CONSTRAINED_MINIMIZATION_REGISTRY.items():
         assert callable(func), f"Registry entry for {method} is not callable"
+
+
+@pytest.mark.parametrize(
+    "force_field,expected",
+    [
+        ("aceff-1.0.0", True),
+        ("Aceff-v0.2", True),
+        ("my-AcEfF-force-field", True),
+        ("openff-2.2.0", False),
+    ],
+)
+def test_is_aceff_force_field(force_field, expected):
+    """Test the _is_aceff_force_field function."""
+    assert _is_aceff_force_field(force_field) is expected
+
+
+@pytest.mark.parametrize(
+    "force_field,expected_platform",
+    [
+        ("aceff-1.0.0", "CUDA"),
+        ("Aceff-v0.2", "CUDA"),
+        ("openff-2.2.0", "Reference"),
+    ],
+)
+def test_get_openmm_platform_name(force_field, expected_platform):
+    """Test the _get_openmm_platform_name function."""
+    assert _get_openmm_platform_name(force_field) == expected_platform
+
+
+def test_minimize_torsions_runs_serial_for_aceff(monkeypatch):
+    """Test that _minimize_torsions runs in serial for AceFF force fields."""
+    data = iter(
+        [
+            (
+                1,
+                "[H:1][C:2]([H:3])([H:4])[H:5]",
+                (0, 1, 2, 3),
+                0.0,
+                numpy.zeros((5, 3)),
+                0.0,
+            ),
+        ],
+    )
+
+    def _fail_if_pool_used(*args, **kwargs):
+        raise AssertionError("Pool should not be used for AceFF force fields")
+
+    def _fake_minimization(input):
+        return ConstrainedMinimizationResult(
+            **input.model_dump(),
+            energy=0.0,
+        )
+
+    monkeypatch.setattr("yammbs.torsion._minimize.Pool", _fail_if_pool_used)
+    monkeypatch.setattr("yammbs.torsion._minimize._run_minimization_constrained", _fake_minimization)
+
+    results = list(
+        _minimize_torsions(
+            data=data,
+            force_field="Aceff-test",
+            n_processes=8,
+            chunksize=64,
+        ),
+    )
+
+    assert len(results) == 1
+    assert results[0].force_field == "Aceff-test"
 
 
 @pytest.mark.parametrize(

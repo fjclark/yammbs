@@ -313,6 +313,14 @@ class TorsionStore:
 
         from yammbs.torsion._minimize import _minimize_torsions
 
+        if "aceff" in force_field.casefold() and (n_processes != 1 or chunksize != 1):
+            LOGGER.info(
+                f"Detected AceFF force field {force_field}; forcing serial minimization "
+                "with n_processes=1 and chunksize=1",
+            )
+            n_processes = 1
+            chunksize = 1
+
         torsion_ids = self.get_torsion_ids()
 
         # TODO Do this by interacting with the database in one step?

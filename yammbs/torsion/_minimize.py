@@ -33,9 +33,20 @@ _ConstrainedMinimizationFn = Callable[
         numpy.ndarray,
         tuple[int, int, int, int],
         float,
+        str,
     ],
     tuple[numpy.ndarray, float],
 ]
+
+
+def _is_aceff_force_field(force_field: str) -> bool:
+    return "aceff" in force_field.casefold()
+
+
+def _get_openmm_platform_name(force_field: str) -> str:
+    if _is_aceff_force_field(force_field):
+        return "CUDA"
+    return "Reference"
 
 
 class ConstrainedMinimizationInput(ImmutableModel):
@@ -131,23 +142,41 @@ def _minimize_torsions(
         ) in data
     )
 
+    use_serial = _is_aceff_force_field(force_field)
+    if use_serial and (n_processes != 1 or chunksize != 1):
+        LOGGER.info(
+            "Forcing serial minimization for AceFF force field "
+            f"{force_field} by setting n_processes=1 and chunksize=1",
+        )
+
+    effective_n_processes = 1 if use_serial else n_processes
+    effective_chunksize = 1 if use_serial else chunksize
+
     LOGGER.info("Setting up multiprocessing pool with generator (of unknown length)")
 
     # TODO: It'd be nice to have the `total` argument passed through, but that would require using
     #       a list-like iterable instead of a generator, which might cause problems at scale
     # maxtasksperchild recycles workers after N tasks, causing the OS to reclaim their
     # GPU memory. This is the most reliable way to bound CUDA memory growth in long runs.
-    with Pool(processes=n_processes, maxtasksperchild=maxtasksperchild) as pool:
+    if effective_n_processes == 1:
         for val in tqdm(
-            pool.imap(
-                _run_minimization_constrained,
-                inputs,
-                chunksize=chunksize,
-            ),
+            (_run_minimization_constrained(input) for input in inputs),
             desc=f"Building and minimizing systems with {force_field}",
         ):
             if val is not None:
                 yield val
+    else:
+        with Pool(processes=effective_n_processes, maxtasksperchild=maxtasksperchild) as pool:
+            for val in tqdm(
+                pool.imap(
+                    _run_minimization_constrained,
+                    inputs,
+                    chunksize=effective_chunksize,
+                ),
+                desc=f"Building and minimizing systems with {force_field}",
+            ):
+                if val is not None:
+                    yield val
 
 
 class ConstrainedMinimizationError(Exception):
@@ -264,6 +293,7 @@ def _minimize_openmm_atoms_frozen(
     positions: numpy.ndarray,
     dihedral_indices: tuple[int, int, int, int],
     angle: float,
+    force_field: str,
 ) -> tuple[numpy.ndarray, float]:
     """Minimize a molecule with OpenMM with 'constraints' on a dihedral."""
     # Add the "dihedral constraint" by zeroing the masses of the dihedral atoms
@@ -282,6 +312,7 @@ def _minimize_openmm_torsion_restrained(
     positions: numpy.ndarray,
     dihedral_indices: tuple[int, int, int, int],
     angle: float,
+    force_field: str,
     restraint_force_group: int = _POSITIONAL_RESTRAINT_FORCE_GROUP,
 ) -> tuple[numpy.ndarray, float]:
     """Minimize a molecule with OpenMM with a strong harmonic restraint on a dihedral.
@@ -305,12 +336,15 @@ def _minimize_openmm_torsion_restrained(
         force_group=restraint_force_group,
     )
 
+    platform_name = _get_openmm_platform_name(force_field)
+    LOGGER.info(f"Using OpenMM platform {platform_name} for {force_field=}")
+
     # Perform minimization with custom energy evaluation
     # that excludes the restraint force group
     context = openmm.Context(
         system,
         openmm.VerletIntegrator(0.1 * openmm.unit.femtoseconds),
-        openmm.Platform.getPlatformByName("CUDA"),
+        openmm.Platform.getPlatformByName(platform_name),
     )
 
     try:
@@ -449,6 +483,7 @@ def _run_minimization_constrained(
             input.coordinates,
             input.dihedral_indices,
             input.grid_id,
+            input.force_field,
         )
     except Exception as e:
         raise ConstrainedMinimizationError(f"Minimization failed for {input=} : {e}") from e

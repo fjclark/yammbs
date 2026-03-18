@@ -122,9 +122,19 @@ def _espaloma(molecule: Molecule, force_field_name: str) -> openmm.System:
     return espaloma.graphs.deploy.openmm_system_from_graph(mol_graph, forcefield=ff[0])
 
 
+def _garnet(molecule: Molecule, force_field_name: str) -> openmm.System:
+    """Get an OpenMM System for a molecule using the Garnet force field."""
+    from garnetff import garnet
+
+    system, top_openmm = garnet.topology_to_openmm_system(molecule.to_topology())
+
+    return system
+
+
 NON_SMIRNOFF_SYSTEM_BUILDERS = {
     "gaff": _gaff,
     "espaloma": _espaloma,
+    "garnet": _garnet,
 }
 
 _omm_system_cache: dict[tuple[str, str], openmm.System] = {}

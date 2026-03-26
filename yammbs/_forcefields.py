@@ -1,4 +1,3 @@
-import copy
 import functools
 import logging
 import re
@@ -137,8 +136,6 @@ NON_SMIRNOFF_SYSTEM_BUILDERS = {
     "garnet": _garnet,
 }
 
-_omm_system_cache: dict[tuple[str, str], openmm.System] = {}
-
 
 def build_omm_system(force_field: str, molecule: Molecule) -> openmm.System:
     """Get an OpenMM System for a given force field and molecule."""
@@ -153,15 +150,8 @@ def build_omm_system(force_field: str, molecule: Molecule) -> openmm.System:
             "as partial charges are not included in the cache key.",
         )
 
-    smiles = molecule.to_smiles(isomeric=True, explicit_hydrogens=True)
-    cache_key = (force_field, smiles)
-
-    if cache_key not in _omm_system_cache:
-        for prefix, builder in NON_SMIRNOFF_SYSTEM_BUILDERS.items():
-            if force_field.startswith(prefix):
-                _omm_system_cache[cache_key] = builder(molecule, force_field)
-                break
-        else:
-            _omm_system_cache[cache_key] = _smirnoff(molecule, force_field)
-
-    return copy.deepcopy(_omm_system_cache[cache_key])
+    for prefix, builder in NON_SMIRNOFF_SYSTEM_BUILDERS.items():
+        if force_field.startswith(prefix):
+            return builder(molecule, force_field)
+    else:
+        return _smirnoff(molecule, force_field)

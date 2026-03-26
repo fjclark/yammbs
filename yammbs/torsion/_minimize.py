@@ -137,24 +137,40 @@ def _subprocess_worker(inp, queue):
         queue.put(e)
 
 
-def _run_minimization_subprocess(
-    input: ConstrainedMinimizationInput,
-) -> ConstrainedMinimizationResult | None:
-    """Run a single minimization in a fresh subprocess to avoid CUDA leaks."""
+def _minimize_torsions_gpu_parallel(inputs, max_workers=2):
     ctx = mp.get_context("spawn")
+
+    active = []
     queue = ctx.Queue()
 
-    proc = ctx.Process(target=_subprocess_worker, args=(input, queue))
-    proc.start()
-    proc.join()
+    def launch(inp):
+        p = ctx.Process(target=_subprocess_worker, args=(inp, queue))
+        p.start()
+        return p
 
-    if not queue.empty():
-        out = queue.get()
-        if isinstance(out, Exception):
-            raise out
-        return out
+    for inp in inputs:
+        # Launch new job
+        active.append(launch(inp))
 
-    return None
+        # If too many running, wait for one to finish
+        if len(active) >= max_workers:
+            proc = active.pop(0)
+            proc.join()
+
+            if not queue.empty():
+                out = queue.get()
+                if isinstance(out, Exception):
+                    raise out
+                yield out
+
+    # Drain remaining
+    for proc in active:
+        proc.join()
+        if not queue.empty():
+            out = queue.get()
+            if isinstance(out, Exception):
+                raise out
+            yield out
 
 
 def _minimize_torsions(
@@ -206,13 +222,7 @@ def _minimize_torsions(
             "running each minimization in a subprocess to avoid CUDA memory leaks.",
         )
 
-        for inp in tqdm(
-            inputs,
-            desc=f"Building and minimizing systems with {force_field} (subprocess/GPU)",
-        ):
-            val = _run_minimization_subprocess(inp)
-            if val is not None:
-                yield val
+        yield from _minimize_torsions_gpu_parallel(inputs, max_workers=2)
         return
 
     LOGGER.info("Setting up multiprocessing pool")

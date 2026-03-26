@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 from yammbs._base.array import Array
 from yammbs._base.base import ImmutableModel
-from yammbs._forcefields import build_omm_system
+from yammbs._forcefields import _is_ml_force_field, build_omm_system
 from yammbs._minimize import (
     _DEFAULT_ENERGY_MINIMIZATION_MAX_ITERATIONS,
     _DEFAULT_ENERGY_MINIMIZATION_TOLERANCE,
@@ -40,12 +40,8 @@ _ConstrainedMinimizationFn = Callable[
 ]
 
 
-def _is_aceff_force_field(force_field: str) -> bool:
-    return "aceff" in force_field.casefold()
-
-
 def _get_openmm_platform_name(force_field: str) -> str:
-    if _is_aceff_force_field(force_field):
+    if _is_ml_force_field(force_field):
         return "CUDA"
     return "Reference"
 
@@ -147,8 +143,6 @@ def _minimize_torsions(
 ) -> Generator[ConstrainedMinimizationResult, None, None]:
     LOGGER.info("Mapping `data` generator into `inputs` generator")
 
-    # It'd be smoother to skip this tranformation - just pass this generator
-    # from inside of TorsionStore
     inputs: Generator[ConstrainedMinimizationInput, None, None] = (
         ConstrainedMinimizationInput(
             torsion_id=torsion_id,
@@ -170,36 +164,38 @@ def _minimize_torsions(
         ) in data
     )
 
-    use_serial = _is_aceff_force_field(force_field)
-    if use_serial and (n_processes != 1 or chunksize != 1):
-        LOGGER.info(
-            "Forcing serial minimization for AceFF force field "
-            f"{force_field} by setting n_processes=1 and chunksize=1",
-        )
-
-    effective_n_processes = 1 if use_serial else n_processes
-    effective_chunksize = 1 if use_serial else chunksize
+    if _is_ml_force_field(force_field):
+        if n_processes != 1:
+            LOGGER.info(
+                f"ML force field {force_field!r} detected; "
+                "ignoring n_processes and running fully serial to avoid CUDA context leaks.",
+            )
+        # No Pool at all — iterate directly in the calling process so that
+        # _cleanup_openmm_resources can release the CUDA context between records.
+        for val in tqdm(
+            (_run_minimization_constrained(inp) for inp in inputs),
+            desc=f"Building and minimizing systems with {force_field} (serial/GPU)",
+        ):
+            if val is not None:
+                yield val
+        return
 
     LOGGER.info("Setting up multiprocessing pool with generator (of unknown length)")
 
-    # TODO: It'd be nice to have the `total` argument passed through, but that would require using
-    #       a list-like iterable instead of a generator, which might cause problems at scale
-    # maxtasksperchild recycles workers after N tasks, causing the OS to reclaim their
-    # GPU memory. This is the most reliable way to bound CUDA memory growth in long runs.
-    if effective_n_processes == 1:
+    if n_processes == 1:
         for val in tqdm(
-            (_run_minimization_constrained(input) for input in inputs),
+            (_run_minimization_constrained(inp) for inp in inputs),
             desc=f"Building and minimizing systems with {force_field}",
         ):
             if val is not None:
                 yield val
     else:
-        with Pool(processes=effective_n_processes, maxtasksperchild=maxtasksperchild) as pool:
+        with Pool(processes=n_processes, maxtasksperchild=maxtasksperchild) as pool:
             for val in tqdm(
                 pool.imap(
                     _run_minimization_constrained,
                     inputs,
-                    chunksize=effective_chunksize,
+                    chunksize=chunksize,
                 ),
                 desc=f"Building and minimizing systems with {force_field}",
             ):
@@ -267,27 +263,19 @@ def _add_torsion_restraint_to_omm_system(
         force_group: Force group to assign the restraint to (default: 1)
 
     """
-    # Create CustomTorsionForce with periodic harmonic potential
-    # dtheta is the shortest angular distance between theta and theta0
-    # This ensures -180° and 180° are treated as equivalent
     torsion_restraint = openmm.CustomTorsionForce(
         "0.5*k_torsion*dtheta^2; dtheta = atan2(sin(theta-theta0), cos(theta-theta0))",
     )
 
-    # Add force constant: 100,000 kcal/(mol*rad^2) to ensure that the angle is
-    # ~ constrained during minimisation.
     torsion_restraint.addGlobalParameter(
         "k_torsion",
         100_000 * openmm.unit.kilocalorie_per_mole / openmm.unit.radian**2,
     )
 
-    # Add per-torsion parameter for target angle
     torsion_restraint.addPerTorsionParameter("theta0")
 
-    # Convert target angle from degrees to radians
     target_angle_rad = target_angle * numpy.pi / 180.0
 
-    # Add the torsion with its target angle
     torsion_restraint.addTorsion(
         int(dihedral_indices[0]),
         int(dihedral_indices[1]),
@@ -296,7 +284,6 @@ def _add_torsion_restraint_to_omm_system(
         [target_angle_rad],
     )
 
-    # Assign to separate force group so it doesn't contribute to final energy
     torsion_restraint.setForceGroup(force_group)
 
     LOGGER.debug(
@@ -309,7 +296,7 @@ def _zero_masses_of_dihedral_atoms(
     system: openmm.System,
     dihedral_indices: tuple[int, int, int, int],
 ) -> None:
-    """Set the masses of the dihedral atoms to zero to 'constrain' them minimization."""
+    """Set the masses of the dihedral atoms to zero to 'constrain' them during minimization."""
     LOGGER.debug(f"Adding restraint to particles not in {dihedral_indices=}")
     for index in dihedral_indices:
         system.setParticleMass(index, 0.0)
@@ -324,14 +311,28 @@ def _minimize_openmm_atoms_frozen(
     force_field: str,
 ) -> tuple[numpy.ndarray, float]:
     """Minimize a molecule with OpenMM with 'constraints' on a dihedral."""
-    # Add the "dihedral constraint" by zeroing the masses of the dihedral atoms
     _zero_masses_of_dihedral_atoms(system=system, dihedral_indices=dihedral_indices)
 
-    return _minimize_openmm(
-        mol=mol,
-        system=system,
-        positions=positions,
-    )
+    platform_name = _get_openmm_platform_name(force_field)
+    context = None
+    integrator = None
+
+    try:
+        final_positions, final_energy = _minimize_openmm(
+            mol=mol,
+            system=system,
+            positions=positions,
+        )
+    finally:
+        # _minimize_openmm creates its own context internally; we call cleanup
+        # here to flush any GPU state that may linger after it returns.
+        _cleanup_openmm_resources(
+            context=context,
+            integrator=integrator,
+            platform_name=platform_name,
+        )
+
+    return final_positions, final_energy
 
 
 def _minimize_openmm_torsion_restrained(
@@ -420,9 +421,7 @@ def _minimize_openmm_torsion_restrained(
 
         # Get final state excluding restraint force group
         final_state = context.getState(getPositions=True, getEnergy=True, groups=groups_mask)
-
         final_positions = final_state.getPositions(asNumpy=True).value_in_unit(openmm.unit.angstrom)
-
         final_energy = final_state.getPotentialEnergy().value_in_unit(openmm.unit.kilocalorie_per_mole)
 
         LOGGER.info(f"Final energy (excluding restraint): {final_energy} kcal/mol")
@@ -482,7 +481,6 @@ def _run_minimization_constrained(
 
     LOGGER.debug(f"Creating molecule from {input.mapped_smiles=}")
     molecule = Molecule.from_mapped_smiles(input.mapped_smiles, allow_undefined_stereo=True)
-    # molecule.add_conformer(Quantity(input.coordinates, "angstrom"))
 
     LOGGER.debug(f"Creating OpenMM system with force field {input.force_field=}")
     try:
@@ -493,14 +491,10 @@ def _run_minimization_constrained(
     except UnassignedValenceError:
         LOGGER.warning(f"Skipping record {input.torsion_id} with unassigned valence terms")
         return None
-    except (RuntimeError, ValueError) as e:  # charging error
+    except (RuntimeError, ValueError) as e:
         LOGGER.warning(f"Skipping record {input.torsion_id} with a value error (probably a charge failure): {e}")
         return None
 
-    atom_indices = list(range(len(molecule.atoms)))
-    atom_indices = sorted(set(atom_indices))  # - set([index - 0 for index in input.dihedral_indices]))
-
-    # Add the restraint force to the system
     _restrain_omm_system(
         mol=molecule,
         system=system,

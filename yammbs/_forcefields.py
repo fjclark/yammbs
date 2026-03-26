@@ -46,6 +46,18 @@ def _lazy_load_force_field(force_field_name: str) -> ForceField:
     )
 
 
+def _is_ml_force_field(force_field: str) -> bool:
+    """Return True for ML force fields (AceFF, AIMNet, etc.).
+
+    Systems built from these force fields must not be cached: the openmm.System
+    object (or the underlying ML potential) may hold a live CUDA context, and
+    keeping it in a module-level dict prevents the GPU memory from ever being
+    released between torsion points.
+    """
+    _ML_FF_PREFIXES = ("aceff", "aimnet")
+    return any(prefix in force_field.casefold() for prefix in _ML_FF_PREFIXES)
+
+
 def _smirnoff(molecule: Molecule, force_field_path: str) -> openmm.System:
     from openff.toolkit import ForceField
 

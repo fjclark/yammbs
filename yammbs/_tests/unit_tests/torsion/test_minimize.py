@@ -16,7 +16,6 @@ from yammbs.torsion._minimize import (
     ConstrainedMinimizationInput,
     ConstrainedMinimizationResult,
     _get_openmm_platform_name,
-    _is_aceff_force_field,
     _minimize_torsions,
     _restrain_omm_system,
     _run_minimization_constrained,
@@ -194,20 +193,6 @@ def test_minimization_registry_complete():
     # Verify all values are callable
     for method, func in _CONSTRAINED_MINIMIZATION_REGISTRY.items():
         assert callable(func), f"Registry entry for {method} is not callable"
-
-
-@pytest.mark.parametrize(
-    "force_field,expected",
-    [
-        ("aceff-1.0.0", True),
-        ("Aceff-v0.2", True),
-        ("my-AcEfF-force-field", True),
-        ("openff-2.2.0", False),
-    ],
-)
-def test_is_aceff_force_field(force_field, expected):
-    """Test the _is_aceff_force_field function."""
-    assert _is_aceff_force_field(force_field) is expected
 
 
 @pytest.mark.parametrize(

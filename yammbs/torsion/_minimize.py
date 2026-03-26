@@ -1,4 +1,5 @@
 import logging
+import warnings
 from collections.abc import Callable, Generator
 from gc import collect
 from multiprocessing import Pool
@@ -18,6 +19,13 @@ from yammbs._minimize import (
     _DEFAULT_ENERGY_MINIMIZATION_MAX_ITERATIONS,
     _DEFAULT_ENERGY_MINIMIZATION_TOLERANCE,
     _minimize_openmm,
+)
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"`torch\.distributed\.reduce_op` is deprecated",
+    category=FutureWarning,
+    module=r"openff\.interchange",
 )
 
 LOGGER = logging.getLogger(__name__)

@@ -1,4 +1,5 @@
 import logging
+import multiprocessing as mp
 import warnings
 from collections.abc import Callable, Generator
 from gc import collect
@@ -30,10 +31,8 @@ warnings.filterwarnings(
 
 LOGGER = logging.getLogger(__name__)
 
-# Set high force group number to avoid conflicts.
-# TODO: More rigorously avoid adding forces to the
-# same group as any existing forces in the system
 _POSITIONAL_RESTRAINT_FORCE_GROUP = 31
+
 
 _ConstrainedMinimizationFn = Callable[
     [
@@ -125,8 +124,37 @@ class ConstrainedMinimizationInput(ImmutableModel):
 class ConstrainedMinimizationResult(ConstrainedMinimizationInput):
     energy: float = Field(
         ...,
-        description="Minimized energy in kcal/mol",
+        description="Minimized energy in kcal/mol (excluding any restraint contributions)",
     )
+
+
+def _subprocess_worker(inp, queue):
+    """Top-level worker function (must be pickleable)."""
+    try:
+        result = _run_minimization_constrained(inp)
+        queue.put(result)
+    except Exception as e:
+        queue.put(e)
+
+
+def _run_minimization_subprocess(
+    input: ConstrainedMinimizationInput,
+) -> ConstrainedMinimizationResult | None:
+    """Run a single minimization in a fresh subprocess to avoid CUDA leaks."""
+    ctx = mp.get_context("spawn")
+    queue = ctx.Queue()
+
+    proc = ctx.Process(target=_subprocess_worker, args=(input, queue))
+    proc.start()
+    proc.join()
+
+    if not queue.empty():
+        out = queue.get()
+        if isinstance(out, Exception):
+            raise out
+        return out
+
+    return None
 
 
 def _minimize_torsions(
@@ -173,22 +201,21 @@ def _minimize_torsions(
     )
 
     if _is_ml_force_field(force_field):
-        if n_processes != 1:
-            LOGGER.info(
-                f"ML force field {force_field!r} detected; "
-                "ignoring n_processes and running fully serial to avoid CUDA context leaks.",
-            )
-        # No Pool at all — iterate directly in the calling process so that
-        # _cleanup_openmm_resources can release the CUDA context between records.
-        for val in tqdm(
-            (_run_minimization_constrained(inp) for inp in inputs),
-            desc=f"Building and minimizing systems with {force_field} (serial/GPU)",
+        LOGGER.info(
+            f"ML force field {force_field!r} detected; "
+            "running each minimization in a subprocess to avoid CUDA memory leaks.",
+        )
+
+        for inp in tqdm(
+            inputs,
+            desc=f"Building and minimizing systems with {force_field} (subprocess/GPU)",
         ):
+            val = _run_minimization_subprocess(inp)
             if val is not None:
                 yield val
         return
 
-    LOGGER.info("Setting up multiprocessing pool with generator (of unknown length)")
+    LOGGER.info("Setting up multiprocessing pool")
 
     if n_processes == 1:
         for val in tqdm(

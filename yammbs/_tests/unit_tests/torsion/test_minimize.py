@@ -198,8 +198,8 @@ def test_minimization_registry_complete():
 @pytest.mark.parametrize(
     "force_field,expected_platform",
     [
-        ("aceff-1.0.0", "CUDA"),
-        ("Aceff-v0.2", "CUDA"),
+        ("aceff-2.0", "CUDA"),
+        ("aimnet2", "CUDA"),
         ("openff-2.2.0", "Reference"),
     ],
 )
@@ -226,14 +226,14 @@ def test_minimize_torsions_runs_serial_for_aceff(monkeypatch):
     def _fail_if_pool_used(*args, **kwargs):
         raise AssertionError("Pool should not be used for AceFF force fields")
 
-    def _fake_minimization(input):
+    def _fake_subprocess_minimization(input):
         return ConstrainedMinimizationResult(
             **input.model_dump(),
             energy=0.0,
         )
 
     monkeypatch.setattr("yammbs.torsion._minimize.Pool", _fail_if_pool_used)
-    monkeypatch.setattr("yammbs.torsion._minimize._run_minimization_constrained", _fake_minimization)
+    monkeypatch.setattr("yammbs.torsion._minimize._run_minimization_subprocess", _fake_subprocess_minimization)
 
     results = list(
         _minimize_torsions(

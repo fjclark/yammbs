@@ -83,7 +83,11 @@ def _smirnoff(molecule: Molecule, force_field_path: str) -> openmm.System:
         logger.info("Deregistering Constraints handler from SMIRNOFF force field")
         force_field.deregister_parameter_handler("Constraints")
 
-    return force_field.create_openmm_system(molecule.to_topology())
+    # Plugin non-bonded handlers (e.g. DoubleExponential) need separate nonbonded forces
+    combine_nonbonded_forces = "vdW" in force_field.registered_parameter_handlers
+    return force_field.create_interchange(molecule.to_topology()).to_openmm(
+        combine_nonbonded_forces=combine_nonbonded_forces,
+    )
 
 
 def _gaff(molecule: Molecule, force_field_name: str) -> openmm.System:
